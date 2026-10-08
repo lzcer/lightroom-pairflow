@@ -6,9 +6,9 @@ return {
     LrPluginInfoUrl = 'https://github.com/lzcer/lightroom-pairflow',
     LrLibraryMenuItems = {
         {
-            title = 'PairFlow：同步 JPEG 到 RAW...',
+            title = 'PairFlow：同步 RAW/JPEG 选片标记...',
             file = 'Sync.lua',
         },
     },
-    VERSION = { major = 0, minor = 1, revision = 0, build = 1 },
+    VERSION = { major = 0, minor = 2, revision = 0, build = 1 },
 }

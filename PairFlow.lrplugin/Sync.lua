@@ -11,22 +11,24 @@ local Pairing = require 'Pairing'
 local Adapter = require 'CatalogAdapter'
 local Report = require 'Report'
 
-local function chooseOptions(context)
-    local prefs = LrPrefs.prefsForPlugin()
-    local props = LrBinding.makePropertyTable(context)
-    props.rating = prefs.rating ~= false
-    props.color = prefs.color ~= false
-    props.pick = prefs.pick ~= false
-    props.preview = true
+local function chooseOptions(props, prefs)
     local f = LrView.osFactory()
     local answer = LrDialogs.presentModalDialog {
-        title = 'PairFlow：JPEG → RAW 选片标记',
+        title = 'PairFlow：同步 RAW/JPEG 选片标记',
         actionVerb = '继续',
         contents = f:column {
             bind_to_object = props,
             spacing = f:control_spacing(),
             f:static_text {
-                title = '范围：当前选中的 JPEG 原片。\n目标：已导入的同目录同名 RAW/DNG 原片。',
+                title = '范围：当前选中的原片。\n目标：已导入的同目录同名 JPEG 或 RAW/DNG 原片。',
+            },
+            f:popup_menu {
+                value = LrView.bind('mode'),
+                items = {
+                    { title = '自动（按选中照片同步到另一种格式）', value = 'auto' },
+                    { title = 'JPEG → RAW', value = 'jpegToRaw' },
+                    { title = 'RAW → JPEG', value = 'rawToJpeg' },
+                },
             },
             f:checkbox { title = '同步星级', value = LrView.bind('rating') },
             f:checkbox { title = '同步颜色标签', value = LrView.bind('color') },
@@ -34,7 +36,7 @@ local function chooseOptions(context)
             f:separator { fill_horizontal = 1 },
             f:checkbox { title = '仅预览（不写入）', value = LrView.bind('preview') },
             f:static_text {
-                title = 'JPEG 的零星级、无颜色和未选取状态也会覆盖 RAW。\n不修改 Develop 参数；不保存 XMP；不复制或删除文件。',
+                title = '单向同步会覆盖目标标记，包括零星级和空状态。\n自动模式两边都选中：保留唯一星级；两边都有星则跳过整对。\n颜色标签或选取状态不同时，跳过冲突字段。',
             },
         },
     }
@@ -45,46 +47,49 @@ local function chooseOptions(context)
     if props.pick then fields[#fields + 1] = 'pickStatus' end
     if #fields == 0 then
         LrDialogs.message('PairFlow', '请至少勾选一个同步字段。', 'info')
-        return nil
+        return { invalid = true }
     end
     prefs.rating, prefs.color, prefs.pick = props.rating, props.color, props.pick
-    return { fields = fields, preview = props.preview }
+    return { fields = fields, preview = props.preview, mode = props.mode }
 end
 
-LrFunctionContext.postAsyncTaskWithContext('PairFlow', function(context)
-    context:addFailureHandler(function(_, err)
-        LrDialogs.message('PairFlow：操作失败', tostring(err), 'critical')
-    end)
-    local catalog = LrApplication.activeCatalog()
-    if not catalog:getTargetPhoto() then
-        LrDialogs.message('PairFlow', '请先选中需要同步的 JPEG 原片。', 'info')
-        return
-    end
-    local selected = catalog:getTargetPhotos()
-    local options = chooseOptions(context)
-    if not options then return end
-
+local function runOptions(context, catalog, selected, options)
     local progress = LrProgressScope { title = 'PairFlow：扫描配对', functionContext = context }
     progress:setCancelable(true)
-    local sources, folders, ignored = Adapter.collect(catalog, selected, progress)
-    progress:done()
+    local sources, folders, ignored = Adapter.collect(catalog, selected, progress, options.mode)
     if not sources then
+        progress:done()
         LrDialogs.message('PairFlow', '扫描已取消，没有写入任何选片标记。', 'info')
-        return
+        return false
     end
     if #sources == 0 then
-        LrDialogs.message('PairFlow', '选中项中没有 JPEG 原片。请分开导入 RAW/JPEG，并过滤 JPEG 后选择。', 'info')
-        return
+        progress:done()
+        LrDialogs.message('PairFlow', '选中项中没有适用于当前模式的 JPEG 或 RAW/DNG 原片。', 'info')
+        return false
     end
-    local plan = Pairing.build(sources, folders)
+    local plan = Pairing.build(sources, folders, options.mode)
+    for _, pair in ipairs(plan.pairs) do
+        if progress:isCanceled() then
+            progress:done()
+            return false
+        end
+        pair.resolution = Adapter.inspect(pair, options.fields)
+        LrTasks.yield()
+    end
+    local scanCanceled = progress:isCanceled()
+    progress:done()
+    if scanCanceled then
+        LrDialogs.message('PairFlow', '扫描已取消，没有写入任何选片标记。', 'info')
+        return false
+    end
     if options.preview or #plan.pairs == 0 then
         Report.show(Report.text(plan, options.fields, ignored), true)
-        return
+        return false
     end
     local confirmed = LrDialogs.confirm('PairFlow：确认同步',
-        Report.summary(plan, ignored) .. '\n\n将覆盖勾选的 RAW 标记，包括 JPEG 的零星级、无颜色和未选取状态。\n取消执行会保留已经完成的配对。',
+        Report.summary(plan, ignored) .. '\n\n单向同步将覆盖勾选的目标标记，包括来源的零星级、空颜色和未选取状态。\n自动模式两边都选中时，按星级和字段冲突规则处理。\n取消执行会保留已经完成的配对。',
         '同步', '取消')
-    if confirmed ~= 'ok' then return end
+    if confirmed ~= 'ok' then return false end
 
     local execution = LrProgressScope { title = 'PairFlow：同步标记', functionContext = context }
     execution:setCancelable(true)
@@ -100,4 +105,29 @@ LrFunctionContext.postAsyncTaskWithContext('PairFlow', function(context)
     local canceled = execution:isCanceled()
     execution:done()
     Report.show(Report.text(plan, options.fields, ignored, results, canceled), false)
+    return true
+end
+
+LrFunctionContext.postAsyncTaskWithContext('PairFlow', function(context)
+    context:addFailureHandler(function(_, err)
+        LrDialogs.message('PairFlow：操作失败', tostring(err), 'critical')
+    end)
+    local catalog = LrApplication.activeCatalog()
+    if not catalog:getTargetPhoto() then
+        LrDialogs.message('PairFlow', '请先选中需要同步的 JPEG 或 RAW/DNG 原片。', 'info')
+        return
+    end
+    local selected = catalog:getTargetPhotos()
+    local prefs = LrPrefs.prefsForPlugin()
+    local props = LrBinding.makePropertyTable(context)
+    props.rating = prefs.rating ~= false
+    props.color = prefs.color ~= false
+    props.pick = prefs.pick ~= false
+    props.preview = false
+    props.mode = 'auto'
+    while true do
+        local options = chooseOptions(props, prefs)
+        if not options then return end
+        if not options.invalid and runOptions(context, catalog, selected, options) then return end
+    end
 end)
